@@ -1,6 +1,6 @@
 # $Id: configure.ac 386451 2006-03-16 20:27:11Z archie $
 
-AC_INIT([s3backer FUSE filesystem backed by Amazon S3], [1.0.5], [http://s3backer.googlecode.com/], [s3backer])
+AC_INIT([s3backer FUSE filesystem backed by Amazon S3], [1.0.2], [http://s3backer.googlecode.com/], [s3backer])
 AC_CONFIG_AUX_DIR(scripts)
 AM_INIT_AUTOMAKE
 dnl AM_MAINTAINER_MODE
@@ -10,16 +10,12 @@ AC_PREFIX_DEFAULT(/usr)
 AC_PROG_MAKE_SET
 
 [CFLAGS='-g -O3 -pipe -Wall -Waggregate-return -Wcast-align -Wchar-subscripts -Wcomment -Wformat -Wimplicit -Wmissing-declarations -Wmissing-prototypes -Wnested-externs -Wno-long-long -Wparentheses -Wpointer-arith -Wredundant-decls -Wreturn-type -Wswitch -Wtrigraphs -Wuninitialized -Wunused -Wwrite-strings -Wshadow -Wstrict-prototypes -Wcast-qual']
-[test `uname -s` = 'Darwin' && CFLAGS="${CFLAGS} -fnested-functions"]
 AC_SUBST(CFLAGS)
 
 # Compile flags for Linux
 AC_DEFINE(_GNU_SOURCE, 1, GNU functions)
 AC_DEFINE(_BSD_SOURCE, 1, BSD functions)
 AC_DEFINE(_XOPEN_SOURCE, 500, XOpen functions)
-
-# Compile flags for Mac OS
-AC_DEFINE(_DARWIN_C_SOURCE, 1, MacOS functions)
 
 # Optional features
 AC_ARG_ENABLE(assertions,

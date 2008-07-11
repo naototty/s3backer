@@ -49,7 +49,6 @@ main(int argc, char **argv)
     pthread_t thread;
     MD5_CTX ctx;
     int i;
-    int r;
 
     /* Get configuration */
     if ((config = s3backer_get_config(argc, argv)) == NULL)
@@ -78,13 +77,6 @@ main(int argc, char **argv)
     for (i = 0; i < config->num_blocks; i++)
         memcpy(&md5s[i * MD5_DIGEST_LENGTH], zero_md5, MD5_DIGEST_LENGTH);
 
-    /* Zero all blocks */
-    for (i = 0; i < config->num_blocks; i++) {
-	fprintf(stderr, "zeroing block #%u\n", i);
-	if ((r = (*store->write_block)(store, i, zero_block)) != 0)
-	    warnx("write error: %s", strerror(r));
-    }
-
     /* Create threads */
     for (i = 0; i < NUM_THREADS; i++)
         pthread_create(&thread, NULL, thread_main, (void *)i);
@@ -105,7 +97,17 @@ thread_main(void *arg)
     MD5_CTX ctx;
     int millis;
     int lockid;
+    int i;
     int r;
+
+    /* Zero all blocks equal to my thread ID modulo #threads */
+    if (id < config->num_blocks) {
+        for (i = id; i < config->num_blocks; i += NUM_THREADS) {
+            fprintf(stderr, "[%2d] zeroing block #%u\n", id, i);
+            if ((r = (*store->write_block)(store, i, zero_block)) != 0)
+                warn("[%2d] write error", id);
+        }
+    }
 
     /* Loop */
     while (1) {
@@ -123,9 +125,9 @@ thread_main(void *arg)
         // Randomly read or write
         pthread_mutex_lock(&locks[lockid]);
         if ((random() % READ_FACTOR) != 0) {
-            fprintf(stderr, "[%2d] rd #%u START\n", id, block_num);
+            fprintf(stderr, "[%2d] rd #%u\n", id, block_num);
             if ((r = (*store->read_block)(store, block_num, data)) != 0) {
-                warnx("[%2d] read error: %s", id, strerror(r));
+                warn("[%2d] read error", id);
                 continue;
             }
             MD5_Init(&ctx);
@@ -141,19 +143,16 @@ thread_main(void *arg)
                   id, g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
                 errx(1, "got wrong MD5 block #%u", block_num);
             }
-            fprintf(stderr, "[%2d] rd #%u COMPLETE\n", id, block_num);
         } else {
-            *((u_int *)data) = random() % ZERO_FACTOR != 0 ? 0 : (u_int)random();
-            fprintf(stderr, "[%2d] wr #%u 0x%08x START\n", id, block_num, *(u_int *)data);
+            fprintf(stderr, "[%2d] wr #%u\n", id, block_num);
+            *((u_int *)data) = random() % ZERO_FACTOR ? 0 : (u_int)random();
             MD5_Init(&ctx);
             MD5_Update(&ctx, data, config->block_size);
             MD5_Final(md5, &ctx);
             if ((r = (*store->write_block)(store, block_num, data)) != 0)
-                warnx("[%2d] write error: %s", id, strerror(r));
+                warn("[%2d] write error", id);
             else
                 memcpy(&md5s[block_num * MD5_DIGEST_LENGTH], md5, MD5_DIGEST_LENGTH);
-            fprintf(stderr, "[%2d] wr #%u 0x%08x %s%s\n", id, block_num, *(u_int *)data,
-              r != 0 ? "FAILED" : "COMPLETE", r != 0 ? strerror(r) : "");
         }
         pthread_mutex_unlock(&locks[lockid]);
     }
