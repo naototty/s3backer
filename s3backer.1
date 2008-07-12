@@ -45,7 +45,7 @@ provides is really more like an S3-backed virtual hard disk device, rather than 
 .Pp
 In typical usage, a `normal' filesystem is mounted on top of the file exported by the
 .Nm
-filesystem using a loopback mount (or disk image mount on Mac OS X).
+filesystem using a loopback mount.
 .Pp
 This arrangement has several benefits compared to more complete S3 filesystem implementations:
 .Bl -tag -width xx
@@ -85,12 +85,12 @@ of incorrect data.
 These are:
 .Bl -tag -width xx
 .It 1.
-.Nm
-enforces a minimum delay between consecutive PUT or DELETE operations on the same block.
-This ensures that Amazon S3 doesn't receive these operations out of order.
+Regarding PUT/DELETE operations on the same block: avoidance of overlapping operations plus a configurable
+minimum delay between consecutive operations. This ensures S3 doesn't receive these operations out of order.
 .It 2.
+An internal MD5 checksum cache, which enables
 .Nm
-maintains an internal block MD5 checksum cache, which enables automatic detection and rejection of `stale' blocks returned by GET operations.
+to automatically detect and reject `stale' information returned by GET operations.
 .El
 .Pp
 This logic is configured by the following command line options:
@@ -107,7 +107,7 @@ As a simple optimization,
 does not store blocks containing all zeroes; instead, they are simply deleted.
 Conversely, reads of non-existent blocks will contain all zeroes.
 .Pp
-As a result, blocks do not need to be created before being used and no special initialization is necessary when creating a new filesystem.
+As a result, no special initialization is necessary when creating a new filesystem.
 .Ss File and Block Size Auto-Detection
 As a convenience, whenever the first block of the backed file is written,
 .Nm
@@ -124,16 +124,12 @@ An Amazon S3 account is not required in order to use
 Of course a filesystem must already exist and have S3 objects with ACL's configured for public read access
 (see
 .Fl \-accessType
-below);
-users should perform the looback mount with the read-only flag (see
-.Xr mount 8 )
-and provide the
-.Fl \-readOnly
-flag to
-.Nm .
+below).
+For read-only access, users should perform the looback mount with the read-only flag (see
+.Xr mount 8 ) .
 This mode of operation facilitates the creation of public, read-only filesystems.
 .Ss Simultaneous Mounts
-Although it functions over the network, the
+Althogh it functions over the network, the
 .Nm
 filesystem is not a distributed filesystem and does not support simultaneous read/write mounts.
 (This is not something you would normally do with a hard-disk partition either.)
@@ -184,16 +180,6 @@ instead of this flag.
 Specify the Amazon S3 access privilege ACL type for newly written blocks.
 The value must be one of `private', `public-read', `public-read-write', or `authenticated-read'.
 Default is `private'.
-.It Fl \-assumeEmpty
-Assume that no blocks exist in S3 yet.
-This enables an optimization whereby zero writes to a block are omitted until there is a non-zero write to the same block.
-This is only valid when the S3 objects do not yet exist, and is useful for example when initializing a large backed file
-from a local copy (such as a Mac OS disk image) that contains mostly zeroes.
-If auto-detection finds that there is in fact a block zero stored in S3, this option will cause
-.Nm
-to exit with an error unless
-.Fl \-force
-is also given.
 .It Fl \-baseURL=URL
 Specify the base URL. Default is `http://s3.amazonaws.com/'.
 .It Fl \-blockSize=SIZE
@@ -258,22 +244,14 @@ Specify the name of the single file that appears in the
 .Nm
 filesystem.
 Default is `file'.
-.It Fl \-fileMode=MODE
-Specify the UNIX permission bits for the single file that appears in the
-.Nm
-filesystem.
-Default is 0600, unless
-.Fl \-readOnly
-is specified, in which case the default is 0400.
 .It Fl \-force
 Proceed even if the value specified by
 .Fl \-blockSize
 or
 .Fl \-size
-disagrees with the auto-detected value, or if
-.Fl \-assumeEmpty
-is given yet auto-detection succeeds.
-This is will certainly lead to garbled data and should be avoided for normal use.
+disagrees with the auto-detected value.
+This is will certainly lead to reading garbled data and should only be used when you
+intend to write over an existing filesystem with a new one.
 .It Fl h Fl \-help
 Print a help message and exit.
 .It Fl \-initialRetryPause=MILLIS
@@ -308,14 +286,9 @@ Default value is 500ms.
 .It Fl \-prefix=STRING
 Specify a prefix to prepend to the resource names within bucket that identify each block.
 Default is the empty string.
-.It Fl \-readOnly
-Assume the filesystem is going to be mounted read-only, and return
-.Er EROFS
-in response to any attempt to write.
-This flag also changes the default mode of the backed file from 0600 to 0400.
 .It Fl \-size=SIZE
 Specify the size (in bytes) of the single file to be exported by the filesystem.
-The size may have an optional suffix 'K' for kilobytes, 'M' for megabytes, 'G' for gigabytes, 'T' for terabytes, or 'E' for exabytes.
+The size may have an optional suffix 'K' for kilobytes, 'M' for megabytes, 'G' for gigabytes, or 'T' for terabytes.
 .Nm
 will attempt to auto-detect the block size by reading block number zero.
 If this option is not specified, the auto-detected value will be used.
@@ -333,9 +306,23 @@ In addition,
 accepts all of the generic FUSE options as well.
 Here is a partial list:
 .Bl -tag -width Ds
+.It Fl d
+Enable FUSE debug mode.
+Implies
+.Fl f
+and
+.Fl \-debug .
+.It Fl f
+Run in the foreground (do not fork).
+Implies
+.Fl \-debug .
+.It Fl s
+Run in single-threaded mode.
 .It Fl o Ar allow_root
 Allow root (only) to view backed file.
 .It Fl o Ar allow_other
+Allow all users to view backed file.
+.It Fl o Ar nonempty
 Allow all users to view backed file.
 .It Fl o Ar uid=UID
 Override the user ID of the backed file, which defaults to the current user ID.
@@ -345,18 +332,6 @@ Override the group ID of the backed file, which defaults to the current group ID
 Do synchronous reads.
 .It Fl o Ar max_readahead=NUM
 Set maximum read-ahead (in bytes).
-.It Fl f
-Run in the foreground (do not fork).
-Implies
-.Fl \-debug .
-.It Fl d
-Enable FUSE debug mode.
-Implies
-.Fl f
-and
-.Fl \-debug .
-.It Fl s
-Run in single-threaded mode.
 .El
 .Pp
 In addition,
@@ -403,12 +378,6 @@ Contains Amazon S3 `accessID:accessKey' pairs.
 .%O http://www.google.com/search?q=linux+page+cache
 .Re
 .Sh BUGS
-For cache space efficiency,
-.Nm
-uses 32 bit values to index individual blocks.
-Therefore, the block size must be increased beyond the default 4K when very large filesystems
-(greater than 16 terabytes) are created.
-.Pp
 .Nm
 should really be implemented as a device rather than a filesystem.
 However, this would require writing a kernel module instead of a simple user-space daemon,

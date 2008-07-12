@@ -126,9 +126,6 @@ struct s3backer_curl_holder {
     struct s3backer_curl_holder *next;
 };
 
-/* CURL prepper function type */
-typedef void (*s3b_curl_prepper_t)(CURL *curl);
-
 /* Simple list structure */
 struct s3backer_list {
     struct block_info           *head;
@@ -148,7 +145,6 @@ struct s3backer_private {
     pthread_cond_t              space_cond;     // signaled when cache space available
     pthread_cond_t              never_cond;     // never signaled; used for sleeping only
     char                        *zero_block;
-    u_char                      *non_zero;      // used when 'assume_empty' is set
 };
 
 /* I/O state when reading/writing a block */
@@ -179,15 +175,14 @@ static void s3backer_get_auth(char *buf, size_t bufsiz, const char *accessKey, c
     const char *ctype, const char *md5, const char *date, const struct curl_slist *headers, const char *resource);
 
 /* HTTP and curl functions */
-static int s3backer_perform_io(struct s3backer_private *priv, const char *method, const char *url,
-    u_int *clenp, s3b_curl_prepper_t prepper);
+static int s3backer_perform_io(CURL* curl, const char *method, const char *url, struct s3backer_conf *const config);
 static size_t s3backer_curl_reader(void *ptr, size_t size, size_t nmemb, void *stream);
 static size_t s3backer_curl_writer(void *ptr, size_t size, size_t nmemb, void *stream);
 static size_t s3backer_curl_header(void *ptr, size_t size, size_t nmemb, void *stream);
 static struct curl_slist *s3backer_add_header(struct curl_slist *headers, const char *fmt, ...);
 static void s3backer_get_date(char *buf, size_t bufsiz);
-static CURL *s3backer_acquire_curl(struct s3backer_private *priv);
-static void s3backer_release_curl(struct s3backer_private *priv, CURL *curl, int may_cache);
+static int s3backer_acquire_curl(struct s3backer_private *priv, CURL **curlp);
+static void s3backer_release_curl(struct s3backer_private *priv, CURL *curl);
 
 /* Data structure manipulation */
 static void s3backer_list_append(struct s3backer_list *list, struct block_info *binfo);
@@ -356,7 +351,6 @@ s3backer_destroy(struct s3backer_store *const s3b)
     g_hash_table_foreach(priv->hashtable, s3backer_free_one, NULL);
     g_hash_table_destroy(priv->hashtable);
     free(priv->zero_block);
-    free(priv->non_zero);
     free(priv);
     free(s3b);
 }
@@ -364,7 +358,6 @@ s3backer_destroy(struct s3backer_store *const s3b)
 static int
 s3backer_detect_sizes(struct s3backer_store *s3b, off_t *file_sizep, u_int *block_sizep)
 {
-    auto void s3b_detect_prepper(CURL *curl);
     struct s3backer_private *const priv = s3b->data;
     struct s3backer_conf *const config = priv->config;
     struct curl_slist *headers = NULL;
@@ -373,10 +366,27 @@ s3backer_detect_sizes(struct s3backer_store *s3b, off_t *file_sizep, u_int *bloc
     char authbuf[200];
     struct s3b_io s3b_io;
     char datebuf[64];
+    double clen;
+    CURL *curl;
     int r;
 
     /* Construct URL for the first block */
     resource = s3backer_get_url(urlbuf, sizeof(urlbuf), config->baseURL, config->bucket, config->prefix, 0);
+
+    /* Initialize I/O state */
+    memset(&s3b_io, 0, sizeof(s3b_io));
+
+    /* Configure cURL instance */
+    if ((r = s3backer_acquire_curl(priv, &curl)) != 0)
+        return r;
+    curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3backer_curl_reader);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s3b_io);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, s3backer_curl_header);
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &s3b_io);
 
     /* Add Date header */
     s3backer_get_date(datebuf, sizeof(datebuf));
@@ -389,34 +399,25 @@ s3backer_detect_sizes(struct s3backer_store *s3b, off_t *file_sizep, u_int *bloc
         headers = s3backer_add_header(headers, "%s: AWS %s:%s", AUTH_HEADER, config->accessId, authbuf);
     }
 
+    /* Set headers */
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
     /* Perform operation */
-    r = s3backer_perform_io(priv, HTTP_HEAD, urlbuf, block_sizep, s3b_detect_prepper);
+    r = s3backer_perform_io(curl, HTTP_HEAD, urlbuf, config);
 
     /* If successful, extract filesystem sizing information */
     if (r == 0) {
-        if (s3b_io.file_size > 0)
+        if (s3b_io.file_size > 0 && curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &clen) == CURLE_OK) {
             *file_sizep = (off_t)s3b_io.file_size;
-        else
+            *block_sizep = (u_int)clen;
+        } else
             r = ENXIO;
     }
 
     /*  Clean up */
     curl_slist_free_all(headers);
+    s3backer_release_curl(priv, curl);
     return r;
-
-    /* CURL prepper function */
-    void s3b_detect_prepper(CURL *curl) {
-        memset(&s3b_io, 0, sizeof(s3b_io));
-        curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
-        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-        curl_easy_setopt(curl, CURLOPT_NOBODY, 1);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3backer_curl_reader);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s3b_io);
-        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, s3backer_curl_header);
-        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &s3b_io);
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    }
 }
 
 static int
@@ -485,11 +486,6 @@ s3backer_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, co
     /* Allocate zero block if necessary */
     if (priv->zero_block == NULL
       && (priv->zero_block = calloc(1, config->block_size)) == NULL)
-        return errno;
-
-    /* Allocate empty block array if necessary */
-    if (config->assume_empty && priv->non_zero == NULL
-      && (priv->non_zero = calloc(1, (config->num_blocks + 7) / 8)) == NULL)
         return errno;
 
     /* Special case handling for all-zeroes blocks */
@@ -598,7 +594,6 @@ writeit:
 static int
 s3backer_do_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, void *dest, const u_char *expect_md5)
 {
-    auto void s3b_read_prepper(CURL *curl);
     struct s3backer_private *const priv = s3b->data;
     struct s3backer_conf *const config = priv->config;
     struct curl_slist *headers = NULL;
@@ -607,10 +602,26 @@ s3backer_do_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, 
     char authbuf[200];
     struct s3b_io s3b_io;
     char datebuf[64];
+    CURL *curl;
     int r;
 
     /* Construct URL for this block */
     resource = s3backer_get_url(urlbuf, sizeof(urlbuf), config->baseURL, config->bucket, config->prefix, block_num);
+
+    /* Initialize I/O state */
+    memset(&s3b_io, 0, sizeof(s3b_io));
+    s3b_io.rdremain = config->block_size;
+    s3b_io.rdbuf = dest;
+
+    /* Configure cURL instance */
+    if ((r = s3backer_acquire_curl(priv, &curl)) != 0)
+        return r;
+    curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3backer_curl_reader);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s3b_io);
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)config->block_size);
 
     /* Add Date header */
     s3backer_get_date(datebuf, sizeof(datebuf));
@@ -630,13 +641,16 @@ s3backer_do_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, 
         headers = s3backer_add_header(headers, "%s: AWS %s:%s", AUTH_HEADER, config->accessId, authbuf);
     }
 
+    /* Set headers */
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
     /* Perform operation */
-    r = s3backer_perform_io(priv, HTTP_GET, urlbuf, NULL, s3b_read_prepper);
+    r = s3backer_perform_io(curl, HTTP_GET, urlbuf, config);
 
     /* Check for short read */
     if (r == 0 && s3b_io.rdremain != 0) {
-        (*config->log)(LOG_WARNING, "read of block #%u returned %lu < %lu bytes",
-          block_num, (u_long)(config->block_size - s3b_io.rdremain), (u_long)config->block_size);
+        (*config->log)(LOG_WARNING, "read of block #%u returned %u < %u bytes",
+          block_num, config->block_size - s3b_io.rdremain, config->block_size);
         memset((char *)dest + config->block_size - s3b_io.rdremain, 0, s3b_io.rdremain);
     }
 
@@ -648,64 +662,59 @@ s3backer_do_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, 
 
     /*  Clean up */
     curl_slist_free_all(headers);
+    s3backer_release_curl(priv, curl);
     return r;
-
-    /* CURL prepper function */
-    void s3b_read_prepper(CURL *curl) {
-        memset(&s3b_io, 0, sizeof(s3b_io));
-        s3b_io.rdremain = config->block_size;
-        s3b_io.rdbuf = dest;
-        curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
-        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3backer_curl_reader);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s3b_io);
-        curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)config->block_size);
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    }
 }
 
 /*
  * Write block if src != NULL, otherwise delete block.
  */
 static int
-s3backer_do_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, const void *const src, const u_char *md5)
+s3backer_do_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, const void *src, const u_char *md5)
 {
-    auto void s3b_write_prepper(CURL *curl);
     struct s3backer_private *const priv = s3b->data;
     struct s3backer_conf *const config = priv->config;
     struct curl_slist *headers = NULL;
     char urlbuf[strlen(config->baseURL) + strlen(config->bucket) + strlen(config->prefix) + 64];
-    const char *const method = src != NULL ? HTTP_PUT : HTTP_DELETE;
+    const char *method;
     const char *resource;
     char md5buf[(MD5_DIGEST_LENGTH * 4) / 3 + 4];
     char authbuf[200];
     struct s3b_io s3b_io;
     char datebuf[64];
+    CURL *curl;
     int r;
-
-    /* Check for read-only configuration */
-    if (config->read_only)
-        return EROFS;
-
-    /* Don't write zero blocks when 'assume_empty' until non-zero content is written */
-    if (config->assume_empty) {
-        const int byte = block_num / 8;
-        const int bit = 1 << (block_num % 8);
-
-        pthread_mutex_lock(&priv->mutex);
-        if ((priv->non_zero[byte] & bit) == 0) {
-            if (src == NULL) {
-                pthread_mutex_unlock(&priv->mutex);
-                return 0;
-            }
-            priv->non_zero[byte] |= bit;
-        }
-        pthread_mutex_unlock(&priv->mutex);
-    }
 
     /* Construct URL for this block */
     resource = s3backer_get_url(urlbuf, sizeof(urlbuf), config->baseURL, config->bucket, config->prefix, block_num);
+
+    /* Initialize I/O state */
+    memset(&s3b_io, 0, sizeof(s3b_io));
+    if (src != NULL) {
+        s3b_io.wrremain = config->block_size;
+        s3b_io.wrbuf = src;
+    }
+
+    /* Configure cURL instance */
+    if ((r = s3backer_acquire_curl(priv, &curl)) != 0)
+        return r;
+    curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
+    curl_easy_setopt(curl, CURLOPT_READFUNCTION, s3backer_curl_writer);
+    curl_easy_setopt(curl, CURLOPT_READDATA, &s3b_io);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3backer_curl_reader);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s3b_io);
+
+    /* Configure for PUT or DELETE */
+    if (src != NULL) {
+        curl_easy_setopt(curl, CURLOPT_UPLOAD, 1);
+        curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)config->block_size);
+        method = HTTP_PUT;
+    } else {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, HTTP_DELETE);
+        method = HTTP_DELETE;
+    }
 
     /* Add Date header */
     s3backer_get_date(datebuf, sizeof(datebuf));
@@ -738,51 +747,30 @@ s3backer_do_write_block(struct s3backer_store *const s3b, s3b_block_t block_num,
         headers = s3backer_add_header(headers, "%s: AWS %s:%s", AUTH_HEADER, config->accessId, authbuf);
     }
 
+    /* Set headers */
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
     /* Perform operation */
-    r = s3backer_perform_io(priv, method, urlbuf, NULL, s3b_write_prepper);
+    r = s3backer_perform_io(curl, method, urlbuf, config);
 
     /*  Clean up */
     curl_slist_free_all(headers);
+    s3backer_release_curl(priv, curl);
     return r;
-
-    /* CURL prepper function */
-    void s3b_write_prepper(CURL *curl) {
-        memset(&s3b_io, 0, sizeof(s3b_io));
-        if (src != NULL) {
-            s3b_io.wrremain = config->block_size;
-            s3b_io.wrbuf = src;
-        }
-        curl_easy_setopt(curl, CURLOPT_URL, urlbuf);
-        curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
-        curl_easy_setopt(curl, CURLOPT_READFUNCTION, s3backer_curl_writer);
-        curl_easy_setopt(curl, CURLOPT_READDATA, &s3b_io);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, s3backer_curl_reader);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &s3b_io);
-        if (src != NULL) {
-            curl_easy_setopt(curl, CURLOPT_UPLOAD, 1);
-            curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, (curl_off_t)config->block_size);
-        }
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    }
 }
 
 /*
  * Perform HTTP operation.
  */
 static int
-s3backer_perform_io(struct s3backer_private *priv, const char *method, const char *url, u_int *clenp, s3b_curl_prepper_t prepper)
+s3backer_perform_io(CURL* curl, const char *method, const char *url, struct s3backer_conf *const config)
 {
-    struct s3backer_conf *const config = priv->config;
     struct timespec delay;
     CURLcode curl_code;
     u_int retry_pause = 0;
     u_int total_pause;
     long http_code;
-    double clen;
     int attempt;
-    CURL *curl;
 
     /* Debug */
     if (config->debug)
@@ -791,58 +779,24 @@ s3backer_perform_io(struct s3backer_private *priv, const char *method, const cha
     /* Make attempts */
     for (attempt = 0, total_pause = 0; 1; attempt++, total_pause += retry_pause) {
 
-        /* Acquire and initialize CURL instance */
-        if ((curl = s3backer_acquire_curl(priv)) == NULL)
-            return EIO;
-        (*prepper)(curl);
-
         /* Perform HTTP operation and check result */
         if (attempt > 0)
             (*config->log)(LOG_INFO, "retrying query (attempt #%d): %s %s", attempt + 1, method, url);
-        curl_code = curl_easy_perform(curl);
-
-        /* Handle success */
-        if (curl_code == 0) {
-            int r = 0;
-
+        switch ((curl_code = curl_easy_perform(curl))) {
+        case 0:
 #ifndef NDEBUG
-            /* Extra debug logging */
             if (config->debug)
                 (*config->log)(LOG_DEBUG, "success: %s %s", method, url);
 #endif
-
-            /* Extract content-length (if required) */
-            if (clenp != NULL) {
-                if ((curl_code = curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD, &clen)) == CURLE_OK)
-                    *clenp = (u_int)clen;
-                else {
-                    (*config->log)(LOG_ERR, "can't get content-length: %s", curl_easy_strerror(curl_code));
-                    r = ENXIO;
-                }
-            }
-
-            /* Done */
-            s3backer_release_curl(priv, curl, r == 0);
-            return r;
-        }
-
-        /* Handle errors */
-        switch (curl_code) {
+            return 0;
         case CURLE_OPERATION_TIMEDOUT:
             (*config->log)(LOG_NOTICE, "HTTP operation timeout: %s %s", method, url);
-            s3backer_release_curl(priv, curl, 0);
             break;
         case CURLE_HTTP_RETURNED_ERROR:
-
-            /* Get the HTTP return code */
             if (curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code) != 0) {
                 (*config->log)(LOG_ERR, "unknown HTTP error: %s %s", method, url);
-                s3backer_release_curl(priv, curl, 0);
                 return EIO;
             }
-            s3backer_release_curl(priv, curl, 0);
-
-            /* Special handling for some specific HTTP codes */
             switch (http_code) {
             case HTTP_NOT_FOUND:
 #ifndef NDEBUG
@@ -861,6 +815,8 @@ s3backer_perform_io(struct s3backer_private *priv, const char *method, const cha
                 break;
             default:
                 (*config->log)(LOG_ERR, "rec'd %ld response: %s %s", http_code, method, url);
+                if (http_code < 500)
+                    return EIO;
                 break;
             }
             break;
@@ -1138,8 +1094,8 @@ s3backer_hash_remove(struct s3backer_private *priv, s3b_block_t block_num)
 #endif
 }
 
-static CURL *
-s3backer_acquire_curl(struct s3backer_private *priv)
+static int
+s3backer_acquire_curl(struct s3backer_private *priv, CURL **curlp)
 {
     struct s3backer_conf *const config = priv->config;
     struct s3backer_curl_holder *holder;
@@ -1152,21 +1108,22 @@ s3backer_acquire_curl(struct s3backer_private *priv)
         priv->curls = holder->next;
         pthread_mutex_unlock(&priv->curls_mutex);
         free(holder);
-        curl_easy_reset(curl);
     } else {
         pthread_mutex_unlock(&priv->curls_mutex);
         if ((curl = curl_easy_init()) == NULL) {
             (*config->log)(LOG_ERR, "curl_easy_init() failed");
-            return NULL;
+            return EIO;
         }
     }
+    curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, (long)1);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)config->connect_timeout);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)config->io_timeout);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, config->user_agent);
     //curl_easy_setopt(curl, CURLOPT_VERBOSE);
-    return curl;
+    *curlp = curl;
+    return 0;
 }
 
 static size_t
@@ -1216,11 +1173,11 @@ s3backer_curl_header(void *ptr, size_t size, size_t nmemb, void *stream)
 }
 
 static void
-s3backer_release_curl(struct s3backer_private *priv, CURL *curl, int may_cache)
+s3backer_release_curl(struct s3backer_private *priv, CURL *curl)
 {
     struct s3backer_curl_holder *holder;
 
-    if (!may_cache || (holder = calloc(1, sizeof(*holder))) == NULL) {
+    if ((holder = calloc(1, sizeof(*holder))) == NULL) {
         curl_easy_cleanup(curl);
         return;
     }
