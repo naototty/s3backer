@@ -27,17 +27,13 @@ struct block_cache_conf {
     u_int               block_size;
     u_int               cache_size;
     u_int               write_delay;
-    u_int               timeout;
     u_int               num_threads;
-    u_int               read_ahead;
-    u_int               read_ahead_trigger;
     log_func_t          *log;
 };
 
 /* Statistics structure for block_cache */
 struct block_cache_stats {
     u_int               current_size;
-    double              dirty_ratio;
     u_int               read_hits;
     u_int               read_misses;
     u_int               write_hits;

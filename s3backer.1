@@ -34,14 +34,6 @@
 .Ar bucket
 .Ar /mount/point
 .Ek
-.Pp
-.Nm s3backer
-.Bk -words
-.Fl \-test
-.Op options
-.Ar dir
-.Ar /mount/point
-.Ek
 .Sh DESCRIPTION
 .Nm
 is a filesystem that contains a single file backed by the Amazon Simple Storage Service (Amazon S3).
@@ -106,8 +98,11 @@ maintains an internal block MD5 checksum cache, which enables automatic detectio
 This logic is configured by the following command line options:
 .Fl \-md5CacheSize ,
 .Fl \-md5CacheTime ,
+.Fl \-minWriteDelay ,
+.Fl \-initialRetryPause ,
 and
-.Fl \-minWriteDelay .
+.Fl \-maxRetryPause ,
+all of which have default values.
 .Ss Zeroed Block Optimization
 As a simple optimization,
 .Nm
@@ -132,9 +127,7 @@ includes support for an internal block cache to increase performance.
 The block cache cache is completely separate from the MD5 cache which only stores MD5 checksums transiently and whose sole purpose is to
 mitigate ``eventual consistency''.
 The block cache is a traditional cache containing cached data blocks.
-When full, clean blocks are evicted as necessary in LRU order.
-.Pp
-Reads of cached blocks will return immediately with no network traffic.
+When enabled, reads of cached blocks return immediately with no network traffic.
 Writes to the cache also return immediately and trigger an asynchronous write operation to the network via a separate worker thread.
 Because the kernel typically writes blocks through FUSE filesystems one at a time, performing writes asynchronously allows
 .Nm
@@ -142,26 +135,13 @@ to take advantage of the parallelism inherent in the network, vastly improving w
 .Pp
 The block cache is configured by the following command line options:
 .Fl \-blockCacheSize ,
-.Fl \-blockCacheThreads ,
-.Fl \-blockCacheTimeout ,
+.Fl \-blockCacheThreads
 and
 .Fl \-blockCacheWriteDelay .
-.Ss Read Ahead
-.Nm
-implements a simple read-ahead algorithm in the block cache.
-When a configurable number of blocks are read in order, block cache worker threads are awoken to begin reading subsequent blocks into the block cache.
-Read ahead continues as long as the kernel continues reading blocks sequentially.
-The kernel typically requests blocks one at a time, so having multiple worker threads already reading the next few blocks
-improves read performance by taking advantage of the parallelism inherent in the network.
-.Pp
-Note that the kernel implements a read ahead algorithm as well; its behavior should be taken into consideration.
-Kernel read ahead can be limited using the
-.Fl o Ar max_readahead
-option to FUSE.
 .Ss Read-Only Access
 An Amazon S3 account is not required in order to use
 .Nm .
-The filesystem must already exist and have S3 objects with ACL's configured for public read access
+Of course a filesystem must already exist and have S3 objects with ACL's configured for public read access
 (see
 .Fl \-accessType
 below);
@@ -251,35 +231,26 @@ Default value is 1000.
 Set the size of the thread pool associated with the block cache (if enabled).
 This bounds the number of simultaneous writes that can occur to the network.
 Default value is 20.
-.It Fl \-blockCacheTimeout=MILLIS
-Specify the maximum time a clean entry can remain in the block cache before it will be forcibly evicted and its associated memory freed.
-A value of zero means there is no timeout; in this case, the number of entries in the block cache will never decrease, eventually reaching
-the maximum size configured by
-.Fl \-blockCacheSize
-and staying there.
-Configure a non-zero value if the memory usage of the block cache is a concern.
-Default value is zero (no timeout).
 .It Fl \-blockCacheWriteDelay=MILLIS
 Specify the maximum time a dirty block can remain in the block cache before it must be written out to the network.
 Blocks may be written sooner when there is cache pressure.
 A value of zero configures a ``write-through'' policy; greater values configure a ``write-back'' policy.
 Larger values increase performance when a small number of blocks are accessed repeatedly, at the cost of
 greater inconsistency with the underlying S3 data store.
-Default value is zero.
+.Pp
+Currently this option is ignored; variable write delay in the block cache is not yet implemented and the value is effectively hard-coded to zero.
 .It Fl \-blockSize=SIZE
-Specify the block size.
-This must be a power of two and should be a multiple of the kernel's native page size.
+Specify the block size. This must be a power of two and should be a multiple of the kernel's native page size.
+In fact in almost all cases it should equal the kernel page size.
 The size may have an optional suffix 'K' for kilobytes, 'M' for megabytes, etc.
-.Pp
 .Nm
-supports partial block operations, though this forces a read before each write;
-use of the block cache and proper alignment of the
+supports partial block operations, though for writes this may require a read and then a write;
+proper alignment of the
 .Nm
-block size with the intended use (e.g., the block size of the `upper' filesystem) will help minimize the extra reads.
-Note that even when filesystems are configured for large block sizes, the kernel will often still write page-sized blocks.
-.Pp
+block size with the intended use (e.g., the block size of the `upper' filesystem) will minimize or
+eliminate the extra reads.
 .Nm
-will attempt to auto-detect the block size by reading block number zero at startup.
+will attempt to auto-detect the block size by reading block number zero.
 If this option is not specified, the auto-detected value will be used.
 If this option is specified but disagrees with the auto-detected value,
 .Nm
@@ -288,12 +259,6 @@ will exit with an error unless
 is also given.
 If auto-detection fails because block number zero does not exist, and this option is not specified,
 then the default value of 4K (4096) is used.
-.It Fl \-cacert=FILE
-Specify SSL certificate file to be used when verifying the remote server's identity when operating over SSL connections.
-Equivalent to the
-.Fl \-cacert
-flag documented in
-.Xr curl 1 .
 .It Fl \-debug
 Enable logging of debug messages.
 Note that this flag is different from
@@ -336,12 +301,6 @@ will make multiple retry attempts using an exponential backoff algorithm, starti
 Default value is 200ms.
 See also
 .Fl \-maxRetryPause .
-.It Fl \-insecure
-Do not verify the remote server's identity when operating over SSL connections.
-Equivalent to the
-.Fl \-insecure
-flag documented in
-.Xr curl 1 .
 .It Fl \-maxRetryPause=MILLIS
 Specify the total amount of time in milliseconds
 .Nm
@@ -396,16 +355,6 @@ flag is required.
 .It Fl \-prefix=STRING
 Specify a prefix to prepend to the resource names within bucket that identify each block.
 Default is the empty string.
-.It Fl \-readAhead=NUM
-Configure the number of blocks of read ahead.
-This determines how many blocks will be read into the block cache ahead of the last block read by the kernel when read ahead is active.
-This option has no effect if the block cache is disabled.
-Default value is 4.
-.It Fl \-readAheadTrigger=NUM
-Configure the number of blocks that must be read consecutively before the read ahead algorithm is triggered.
-Once triggered, read ahead will continue as long as the kernel continues reading blocks sequentially.
-This option has no effect if the block cache is disabled.
-Default value is 2.
 .It Fl \-readOnly
 Assume the filesystem is going to be mounted read-only, and return
 .Er EROFS
@@ -422,23 +371,12 @@ If this option is specified but disagrees with the auto-detected value,
 will exit with an error unless
 .Fl \-force
 is also given.
-.It Fl \-ssl
-Equivalent to
-.Bk -words
-.Fl \-baseURL
-.Ar https://s3.amazonaws.com/
-.Ek
 .It Fl \-statsFilename=NAME
 Specify the name of the human-readable statistics file that appears in the
 .Nm
 filesystem.
 A value of empty string disables the appearance of this file.
 Default is `stats'.
-.It Fl \-test
-Operate in local test mode.
-Filesystem blocks are stored as regular files in the directory
-.Ar dir .
-No network traffic occurs.
 .It Fl \-timeout=SECONDS
 Specify a time limit in seconds for one HTTP operation attempt.
 This limits the entire operation including connection time (if not already connected) and data transfer time.
@@ -488,7 +426,7 @@ to FUSE (unless overridden by the user on the command line):
 .Pp
 .Bl -tag -width Ds -compact
 .It Fl o Ar kernel_cache
-.It Fl o Ar fsname=<baseURL><bucket>/<prefix>
+.It Fl o Ar fsname=s3backer
 .It Fl o Ar use_ino
 .It Fl o Ar entry_timeout=31536000
 .It Fl o Ar negative_timeout=31536000
@@ -503,7 +441,6 @@ to FUSE (unless overridden by the user on the command line):
 Contains Amazon S3 `accessID:accessKey' pairs.
 .El
 .Sh SEE ALSO
-.Xr curl 1 ,
 .Xr losetup 8 ,
 .Xr mount 8 ,
 .Xr umount 8 ,

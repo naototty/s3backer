@@ -27,7 +27,6 @@
 #include "ec_protect.h"
 #include "fuse_ops.h"
 #include "http_io.h"
-#include "test_io.h"
 #include "s3b_config.h"
 
 /****************************************************************************
@@ -36,7 +35,6 @@
 
 /* S3 URL */
 #define S3_BASE_URL                                 "http://s3.amazonaws.com/"
-#define S3_BASE_URL_HTTPS                           "https://s3.amazonaws.com/"
 
 /* S3 access permission strings */
 #define S3_ACCESS_PRIVATE                           "private"
@@ -63,9 +61,6 @@
 #define S3BACKER_DEFAULT_BLOCK_CACHE_SIZE           1000
 #define S3BACKER_DEFAULT_BLOCK_CACHE_NUM_THREADS    20
 #define S3BACKER_DEFAULT_BLOCK_CACHE_WRITE_DELAY    0
-#define S3BACKER_DEFAULT_BLOCK_CACHE_TIMEOUT        0
-#define S3BACKER_DEFAULT_READ_AHEAD                 4
-#define S3BACKER_DEFAULT_READ_AHEAD_TRIGGER         2
 
 /* MacFUSE setting for kernel daemon timeout */
 #ifdef __APPLE__
@@ -134,11 +129,8 @@ static struct s3b_config config = {
     /* Block cache config */
     .block_cache= {
         .cache_size=            S3BACKER_DEFAULT_BLOCK_CACHE_SIZE,
-        .num_threads=           S3BACKER_DEFAULT_BLOCK_CACHE_NUM_THREADS,
         .write_delay=           S3BACKER_DEFAULT_BLOCK_CACHE_WRITE_DELAY,
-        .timeout=               S3BACKER_DEFAULT_BLOCK_CACHE_TIMEOUT,
-        .read_ahead=            S3BACKER_DEFAULT_READ_AHEAD,
-        .read_ahead_trigger=    S3BACKER_DEFAULT_READ_AHEAD_TRIGGER,
+        .num_threads=           S3BACKER_DEFAULT_BLOCK_CACHE_NUM_THREADS,
     },
 
     /* FUSE operations config */
@@ -198,23 +190,8 @@ static const struct fuse_opt option_list[] = {
         .value=     FUSE_OPT_KEY_DISCARD
     },
     {
-        .templ=     "--blockCacheTimeout=%u",
-        .offset=    offsetof(struct s3b_config, block_cache.timeout),
-        .value=     FUSE_OPT_KEY_DISCARD
-    },
-    {
         .templ=     "--blockCacheWriteDelay=%u",
         .offset=    offsetof(struct s3b_config, block_cache.write_delay),
-        .value=     FUSE_OPT_KEY_DISCARD
-    },
-    {
-        .templ=     "--readAhead=%u",
-        .offset=    offsetof(struct s3b_config, block_cache.read_ahead),
-        .value=     FUSE_OPT_KEY_DISCARD
-    },
-    {
-        .templ=     "--readAheadTrigger=%u",
-        .offset=    offsetof(struct s3b_config, block_cache.read_ahead_trigger),
         .value=     FUSE_OPT_KEY_DISCARD
     },
     {
@@ -293,26 +270,6 @@ static const struct fuse_opt option_list[] = {
         .value=     FUSE_OPT_KEY_DISCARD
     },
     {
-        .templ=     "--ssl",
-        .offset=    offsetof(struct s3b_config, ssl),
-        .value=     FUSE_OPT_KEY_DISCARD
-    },
-    {
-        .templ=     "--cacert=%s",
-        .offset=    offsetof(struct s3b_config, http_io.cacert),
-        .value=     FUSE_OPT_KEY_DISCARD
-    },
-    {
-        .templ=     "--insecure",
-        .offset=    offsetof(struct s3b_config, http_io.insecure),
-        .value=     FUSE_OPT_KEY_DISCARD
-    },
-    {
-        .templ=     "--test",
-        .offset=    offsetof(struct s3b_config, test),
-        .value=     FUSE_OPT_KEY_DISCARD
-    },
-    {
         .templ=     "--timeout=%u",
         .offset=    offsetof(struct s3b_config, http_io.timeout),
         .value=     FUSE_OPT_KEY_DISCARD
@@ -323,6 +280,7 @@ static const struct fuse_opt option_list[] = {
 /* Default flags we send to FUSE */
 static const char *const s3backer_fuse_defaults[] = {
     "-okernel_cache",
+    "-ofsname=s3backer",
     "-ouse_ino",
     "-oentry_timeout=31536000",
     "-onegative_timeout=31536000",
@@ -380,7 +338,6 @@ static const struct size_suffix size_suffixes[] = {
 struct s3backer_store *block_cache_store;
 struct s3backer_store *ec_protect_store;
 struct s3backer_store *http_io_store;
-struct s3backer_store *test_io_store;
 
 /****************************************************************************
  *                      PUBLIC FUNCTION DEFINITIONS                         *
@@ -389,7 +346,6 @@ struct s3backer_store *test_io_store;
 struct s3b_config *
 s3backer_get_config(int argc, char **argv)
 {
-    char buf[1024];
     int i;
 
     /* Remember user creds */
@@ -416,12 +372,6 @@ s3backer_get_config(int argc, char **argv)
     if (fuse_opt_parse(&config.fuse_args, &config, option_list, handle_unknown_option) != 0)
         return NULL;
 
-    /* Set fsname based on configuration */
-    snprintf(buf, sizeof(buf), "-ofsname=%s%s/%s",
-      config.test ? "" : config.http_io.baseURL, config.http_io.bucket, config.http_io.prefix);
-    if (fuse_opt_insert_arg(&config.fuse_args, 1, buf) != 0)
-        err(1, "fuse_opt_insert_arg");
-
     /* Validate configuration */
     if (validate_config() != 0)
         return NULL;
@@ -445,26 +395,19 @@ s3backer_create_store(struct s3b_config *conf)
     struct s3backer_store *store;
 
     /* Sanity check */
-    if (http_io_store != NULL || test_io_store != NULL)
+    if (http_io_store != NULL)
         return NULL;
 
-    /* Create HTTP (or test) layer */
-    if (conf->test) {
-        if ((test_io_store = test_io_create(&conf->http_io)) == NULL)
-            return NULL;
-        store = test_io_store;
-    } else {
-        if ((http_io_store = http_io_create(&conf->http_io)) == NULL)
-            return NULL;
-        store = http_io_store;
-    }
+    /* Create HTTP layer */
+    if ((http_io_store = http_io_create(&conf->http_io)) == NULL)
+        return NULL;
+    store = http_io_store;
 
     /* Create eventual consistency protection layer (if desired) */
     if (conf->ec_protect.cache_size > 0) {
         if ((ec_protect_store = ec_protect_create(&conf->ec_protect, store)) == NULL) {
             (*store->destroy)(store);
             http_io_store = NULL;
-            test_io_store = NULL;
             return NULL;
         }
         store = ec_protect_store;
@@ -476,7 +419,6 @@ s3backer_create_store(struct s3b_config *conf)
             (*store->destroy)(store);
             ec_protect_store = NULL;
             http_io_store = NULL;
-            test_io_store = NULL;
             return NULL;
         }
         store = block_cache_store;
@@ -509,8 +451,7 @@ s3b_config_print_stats(void *arg, void *prarg, printer_t *printer)
     u_int total_curls;
 
     /* Get HTTP stats */
-    if (http_io_store != NULL)
-        http_io_get_stats(http_io_store, &http_io_stats);
+    http_io_get_stats(http_io_store, &http_io_stats);
 
     /* Get EC protection stats */
     if (ec_protect_store != NULL)
@@ -521,44 +462,42 @@ s3b_config_print_stats(void *arg, void *prarg, printer_t *printer)
         block_cache_get_stats(block_cache_store, &block_cache_stats);
 
     /* Print stats in human-readable form */
-    if (http_io_store != NULL) {
-        (*printer)(prarg, "%-28s %u\n", "http_normal_blocks_read", http_io_stats.normal_blocks_read);
-        (*printer)(prarg, "%-28s %u\n", "http_normal_blocks_written", http_io_stats.normal_blocks_written);
-        (*printer)(prarg, "%-28s %u\n", "http_zero_blocks_read", http_io_stats.zero_blocks_read);
-        (*printer)(prarg, "%-28s %u\n", "http_zero_blocks_written", http_io_stats.zero_blocks_written);
-        if (config.http_io.assume_empty) {
-            (*printer)(prarg, "%-28s %u\n", "http_empty_blocks_read", http_io_stats.empty_blocks_read);
-            (*printer)(prarg, "%-28s %u\n", "http_empty_blocks_written", http_io_stats.empty_blocks_written);
-        }
-        (*printer)(prarg, "%-28s %u\n", "http_gets", http_io_stats.http_gets.count);
-        (*printer)(prarg, "%-28s %u\n", "http_puts", http_io_stats.http_puts.count);
-        (*printer)(prarg, "%-28s %u\n", "http_deletes", http_io_stats.http_deletes.count);
-        (*printer)(prarg, "%-28s %.3f sec\n", "http_avg_get_time", http_io_stats.http_gets.count > 0 ?
-          http_io_stats.http_gets.time / http_io_stats.http_gets.count : 0.0);
-        (*printer)(prarg, "%-28s %.3f sec\n", "http_avg_put_time", http_io_stats.http_puts.count > 0 ?
-          http_io_stats.http_puts.time / http_io_stats.http_puts.count : 0.0);
-        (*printer)(prarg, "%-28s %.3f sec\n", "http_avg_delete_time", http_io_stats.http_deletes.count > 0 ?
-          http_io_stats.http_deletes.time / http_io_stats.http_deletes.count : 0.0);
-        (*printer)(prarg, "%-28s %u\n", "http_unauthorized", http_io_stats.http_unauthorized);
-        (*printer)(prarg, "%-28s %u\n", "http_forbidden", http_io_stats.http_forbidden);
-        (*printer)(prarg, "%-28s %u\n", "http_stale", http_io_stats.http_stale);
-        (*printer)(prarg, "%-28s %u\n", "http_5xx_error", http_io_stats.http_5xx_error);
-        (*printer)(prarg, "%-28s %u\n", "http_4xx_error", http_io_stats.http_4xx_error);
-        (*printer)(prarg, "%-28s %u\n", "http_other_error", http_io_stats.http_other_error);
-        (*printer)(prarg, "%-28s %u\n", "http_num_retries", http_io_stats.num_retries);
-        (*printer)(prarg, "%-28s %ju.%03u sec\n", "http_total_retry_delay",
-          (uintmax_t)(http_io_stats.retry_delay / 1000), (u_int)(http_io_stats.retry_delay % 1000));
-        total_curls = http_io_stats.curl_handles_created + http_io_stats.curl_handles_reused;
-        if (total_curls > 0)
-            curl_reuse_ratio = (double)http_io_stats.curl_handles_reused / (double)total_curls;
-        (*printer)(prarg, "%-28s %.4f\n", "curl_handle_reuse_ratio", curl_reuse_ratio);
-        (*printer)(prarg, "%-28s %u\n", "curl_timeouts", http_io_stats.curl_timeouts);
-        (*printer)(prarg, "%-28s %u\n", "curl_connect_failed", http_io_stats.curl_connect_failed);
-        (*printer)(prarg, "%-28s %u\n", "curl_host_unknown", http_io_stats.curl_host_unknown);
-        (*printer)(prarg, "%-28s %u\n", "curl_out_of_memory", http_io_stats.curl_out_of_memory);
-        (*printer)(prarg, "%-28s %u\n", "curl_other_error", http_io_stats.curl_other_error);
-        total_oom += http_io_stats.out_of_memory_errors;
+    (*printer)(prarg, "%-28s %u\n", "normal_blocks_read", http_io_stats.normal_blocks_read);
+    (*printer)(prarg, "%-28s %u\n", "normal_blocks_written", http_io_stats.normal_blocks_written);
+    (*printer)(prarg, "%-28s %u\n", "zero_blocks_read", http_io_stats.zero_blocks_read);
+    (*printer)(prarg, "%-28s %u\n", "zero_blocks_written", http_io_stats.zero_blocks_written);
+    if (config.http_io.assume_empty) {
+        (*printer)(prarg, "%-28s %u\n", "empty_blocks_read", http_io_stats.empty_blocks_read);
+        (*printer)(prarg, "%-28s %u\n", "empty_blocks_written", http_io_stats.empty_blocks_written);
     }
+    (*printer)(prarg, "%-28s %u\n", "http_gets", http_io_stats.http_gets.count);
+    (*printer)(prarg, "%-28s %u\n", "http_puts", http_io_stats.http_puts.count);
+    (*printer)(prarg, "%-28s %u\n", "http_deletes", http_io_stats.http_deletes.count);
+    (*printer)(prarg, "%-28s %.3f\n", "http_avg_get_time", http_io_stats.http_gets.count > 0 ?
+      http_io_stats.http_gets.time / http_io_stats.http_gets.count : 0.0);
+    (*printer)(prarg, "%-28s %.3f\n", "http_avg_put_time", http_io_stats.http_puts.count > 0 ?
+      http_io_stats.http_puts.time / http_io_stats.http_puts.count : 0.0);
+    (*printer)(prarg, "%-28s %.3f\n", "http_avg_delete_time", http_io_stats.http_deletes.count > 0 ?
+      http_io_stats.http_deletes.time / http_io_stats.http_deletes.count : 0.0);
+    (*printer)(prarg, "%-28s %u\n", "http_unauthorized", http_io_stats.http_unauthorized);
+    (*printer)(prarg, "%-28s %u\n", "http_forbidden", http_io_stats.http_forbidden);
+    (*printer)(prarg, "%-28s %u\n", "http_stale", http_io_stats.http_stale);
+    (*printer)(prarg, "%-28s %u\n", "http_5xx_error", http_io_stats.http_5xx_error);
+    (*printer)(prarg, "%-28s %u\n", "http_4xx_error", http_io_stats.http_4xx_error);
+    (*printer)(prarg, "%-28s %u\n", "http_other_error", http_io_stats.http_other_error);
+    total_curls = http_io_stats.curl_handles_created + http_io_stats.curl_handles_reused;
+    if (total_curls > 0)
+        curl_reuse_ratio = (double)http_io_stats.curl_handles_reused / (double)total_curls;
+    (*printer)(prarg, "%-28s %.4f\n", "curl_handle_reuse_ratio", curl_reuse_ratio);
+    (*printer)(prarg, "%-28s %u\n", "curl_timeouts", http_io_stats.curl_timeouts);
+    (*printer)(prarg, "%-28s %u\n", "curl_connect_failed", http_io_stats.curl_connect_failed);
+    (*printer)(prarg, "%-28s %u\n", "curl_host_unknown", http_io_stats.curl_host_unknown);
+    (*printer)(prarg, "%-28s %u\n", "curl_out_of_memory", http_io_stats.curl_out_of_memory);
+    (*printer)(prarg, "%-28s %u\n", "curl_other_error", http_io_stats.curl_other_error);
+    (*printer)(prarg, "%-28s %u\n", "num_retries", http_io_stats.num_retries);
+    (*printer)(prarg, "%-28s %ju.%03u\n", "total_retry_delay",
+      (uintmax_t)(http_io_stats.retry_delay / 1000), (u_int)(http_io_stats.retry_delay % 1000));
+    total_oom += http_io_stats.out_of_memory_errors;
     if (block_cache_store != NULL) {
         double read_hit_ratio = 0.0;
         double write_hit_ratio = 0.0;
@@ -571,8 +510,7 @@ s3b_config_print_stats(void *arg, void *prarg, printer_t *printer)
         total_writes = block_cache_stats.write_hits + block_cache_stats.write_misses;
         if (total_writes != 0)
             write_hit_ratio = (double)block_cache_stats.write_hits / (double)total_writes;
-        (*printer)(prarg, "%-28s %u blocks\n", "block_cache_current_size", block_cache_stats.current_size);
-        (*printer)(prarg, "%-28s %.4f\n", "block_cache_dirty_ratio", block_cache_stats.dirty_ratio);
+        (*printer)(prarg, "%-28s %u\n", "current_block_cache_size", block_cache_stats.current_size);
         (*printer)(prarg, "%-28s %u\n", "block_cache_read_hits", block_cache_stats.read_hits);
         (*printer)(prarg, "%-28s %u\n", "block_cache_read_misses", block_cache_stats.read_misses);
         (*printer)(prarg, "%-28s %.4f\n", "block_cache_read_hit_ratio", read_hit_ratio);
@@ -582,12 +520,10 @@ s3b_config_print_stats(void *arg, void *prarg, printer_t *printer)
         total_oom += ec_protect_stats.out_of_memory_errors;
     }
     if (ec_protect_store != NULL) {
-        (*printer)(prarg, "%-28s %u blocks\n", "md5_cache_current_size", ec_protect_stats.current_cache_size);
+        (*printer)(prarg, "%-28s %u\n", "current_md5_cache_size", ec_protect_stats.current_cache_size);
         (*printer)(prarg, "%-28s %u\n", "md5_cache_data_hits", ec_protect_stats.cache_data_hits);
-        (*printer)(prarg, "%-28s %ju.%03u sec\n", "md5_cache_full_delays",
-          (uintmax_t)(ec_protect_stats.cache_full_delay / 1000), (u_int)(ec_protect_stats.cache_full_delay % 1000));
-        (*printer)(prarg, "%-28s %ju.%03u sec\n", "md5_cache_write_delays",
-          (uintmax_t)(ec_protect_stats.repeated_write_delay / 1000), (u_int)(ec_protect_stats.repeated_write_delay % 1000));
+        (*printer)(prarg, "%-28s %ju\n", "md5_cache_full_delay", (uintmax_t)ec_protect_stats.cache_full_delay);
+        (*printer)(prarg, "%-28s %ju\n", "repeated_write_delay", (uintmax_t)ec_protect_stats.repeated_write_delay);
         total_oom += block_cache_stats.out_of_memory_errors;
     }
     (*printer)(prarg, "%-28s %u\n", "out_of_memory_errors", total_oom);
@@ -734,7 +670,6 @@ validate_config(void)
     const char *s;
     char blockSizeBuf[64];
     char fileSizeBuf[64];
-    struct stat sb;
     int i;
     int r;
 
@@ -761,9 +696,7 @@ validate_config(void)
         search_access_for(config.accessFile, NULL, &config.http_io.accessId, NULL);
     if (config.http_io.accessId != NULL && *config.http_io.accessId == '\0')
         config.http_io.accessId = NULL;
-    if (config.http_io.accessId == NULL
-      && !config.fuse_ops.read_only
-      && (strcmp(config.http_io.baseURL, S3_BASE_URL) == 0 || strcmp(config.http_io.baseURL, S3_BASE_URL_HTTPS) == 0)) {
+    if (config.http_io.accessId == NULL && strcmp(config.http_io.baseURL, S3_BASE_URL) == 0 && !config.fuse_ops.read_only) {
         warnx("warning: no `accessId' specified; only read operations will succeed");
         warnx("you can eliminate this warning by providing the `--readOnly' flag");
     }
@@ -782,30 +715,14 @@ validate_config(void)
         }
     }
 
-    /* Check bucket/testdir */
-    if (!config.test) {
-        if (config.http_io.bucket == NULL) {
-            warnx("no S3 bucket specified");
-            return -1;
-        }
-        if (*config.http_io.bucket == '\0' || *config.http_io.bucket == '/' || strchr(config.http_io.bucket, '/') != 0) {
-            warnx("invalid S3 bucket `%s'", config.http_io.bucket);
-            return -1;
-        }
-    } else {
-        if (config.http_io.bucket == NULL) {
-            warnx("no test directory specified");
-            return -1;
-        }
-        if (stat(config.http_io.bucket, &sb) == -1) {
-            warn("%s", config.http_io.bucket);
-            return -1;
-        }
-        if (!S_ISDIR(sb.st_mode)) {
-            errno = ENOTDIR;
-            warn("%s", config.http_io.bucket);
-            return -1;
-        }
+    /* Check bucket */
+    if (config.http_io.bucket == NULL) {
+        warnx("no bucket specified");
+        return -1;
+    }
+    if (*config.http_io.bucket == '\0' || *config.http_io.bucket == '/' || strchr(config.http_io.bucket, '/') != 0) {
+        warnx("invalid S3 bucket `%s'", config.http_io.bucket);
+        return -1;
     }
 
     /* Check base URL */
@@ -825,14 +742,6 @@ validate_config(void)
     if (s == NULL) {
         warnx("invalid base URL `%s'", config.http_io.baseURL);
         return -1;
-    }
-    if (config.ssl) {
-        if (strcmp(config.http_io.baseURL, S3BACKER_DEFAULT_BASE_URL) != 0
-          && strcmp(config.http_io.baseURL, S3_BASE_URL_HTTPS) != 0) {
-            warnx("specify only one of `--baseURL' and `--ssl'");
-            return -1;
-        }
-        config.http_io.baseURL = S3_BASE_URL_HTTPS;
     }
 
     /* Check S3 access privilege */
@@ -909,21 +818,14 @@ validate_config(void)
      * Read the first block (if any) to determine existing file and block size,
      * and compare with configured sizes (if given).
      */
-    if (config.test)
-        config.no_auto_detect = 1;
+    if ((s3b = http_io_create(&config.http_io)) == NULL)
+        err(1, "http_io_create");
     if (config.no_auto_detect)
         r = ENOENT;
     else {
-        config.http_io.debug = config.debug;
-        config.http_io.log = config.log;
-        if ((s3b = http_io_create(&config.http_io)) == NULL)
-            err(1, "http_io_create");
         warnx("auto-detecting block size and total file size...");
-        r = http_io_detect_sizes(s3b, &auto_file_size, &auto_block_size);
-        (*s3b->destroy)(s3b);
+        r = (*s3b->detect_sizes)(s3b, &auto_file_size, &auto_block_size);
     }
-
-    /* Check result */
     switch (r) {
     case 0:
         unparse_size_string(blockSizeBuf, sizeof(blockSizeBuf), (uintmax_t)auto_block_size);
@@ -985,6 +887,7 @@ validate_config(void)
         err(1, "can't read block zero meta-data");
         break;
     }
+    (*s3b->destroy)(s3b);
 
     /* Check computed block and file sizes */
     if (config.block_size != (1 << (ffs(config.block_size) - 1))) {
@@ -1041,6 +944,7 @@ validate_config(void)
     config.http_io.num_blocks = config.num_blocks;
     config.http_io.log = config.log;
     config.ec_protect.block_size = config.block_size;
+    config.ec_protect.num_blocks = config.num_blocks;
     config.ec_protect.log = config.log;
     config.fuse_ops.block_size = config.block_size;
     config.fuse_ops.num_blocks = config.num_blocks;
@@ -1056,37 +960,33 @@ dump_config(void)
     int i;
 
     (*config.log)(LOG_DEBUG, "s3backer config:");
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "test mode", config.test ? "true" : "false");
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "accessId", config.http_io.accessId != NULL ? config.http_io.accessId : "");
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "accessKey", config.http_io.accessKey != NULL ? "****" : "");
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "accessFile", config.accessFile);
-    (*config.log)(LOG_DEBUG, "%24s: %s", "accessType", config.http_io.accessType);
-    (*config.log)(LOG_DEBUG, "%24s: %s", "assume_empty", config.http_io.assume_empty ? "true" : "false");
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "baseURL", config.http_io.baseURL);
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", config.test ? "testdir" : "bucket", config.http_io.bucket);
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "prefix", config.http_io.prefix);
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "mount", config.mount);
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "filename", config.fuse_ops.filename);
-    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "stats_filename", config.fuse_ops.stats_filename);
-    (*config.log)(LOG_DEBUG, "%24s: %s (%u)", "block_size",
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "accessId", config.http_io.accessId != NULL ? config.http_io.accessId : "");
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "accessKey", config.http_io.accessKey != NULL ? "****" : "");
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "accessFile", config.accessFile);
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "access", config.http_io.accessType);
+    (*config.log)(LOG_DEBUG, "%16s: %s", "assume_empty", config.http_io.assume_empty ? "true" : "false");
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "baseURL", config.http_io.baseURL);
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "bucket", config.http_io.bucket);
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "prefix", config.http_io.prefix);
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "mount", config.mount);
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "filename", config.fuse_ops.filename);
+    (*config.log)(LOG_DEBUG, "%16s: \"%s\"", "stats_filename", config.fuse_ops.stats_filename);
+    (*config.log)(LOG_DEBUG, "%16s: %s (%u)", "block_size",
       config.block_size_str != NULL ? config.block_size_str : "-", config.block_size);
-    (*config.log)(LOG_DEBUG, "%24s: %s (%jd)", "file_size",
+    (*config.log)(LOG_DEBUG, "%16s: %s (%jd)", "file_size",
       config.file_size_str != NULL ? config.file_size_str : "-", (intmax_t)config.file_size);
-    (*config.log)(LOG_DEBUG, "%24s: %jd", "num_blocks", (intmax_t)config.num_blocks);
-    (*config.log)(LOG_DEBUG, "%24s: 0%o", "file_mode", config.fuse_ops.file_mode);
-    (*config.log)(LOG_DEBUG, "%24s: %s", "read_only", config.fuse_ops.read_only ? "true" : "false");
-    (*config.log)(LOG_DEBUG, "%24s: %us", "timeout", config.http_io.timeout);
-    (*config.log)(LOG_DEBUG, "%24s: %ums", "initial_retry_pause", config.http_io.initial_retry_pause);
-    (*config.log)(LOG_DEBUG, "%24s: %ums", "max_retry_pause", config.http_io.max_retry_pause);
-    (*config.log)(LOG_DEBUG, "%24s: %ums", "min_write_delay", config.ec_protect.min_write_delay);
-    (*config.log)(LOG_DEBUG, "%24s: %ums", "md5_cache_time", config.ec_protect.cache_time);
-    (*config.log)(LOG_DEBUG, "%24s: %u entries", "md5_cache_size", config.ec_protect.cache_size);
-    (*config.log)(LOG_DEBUG, "%24s: %u entries", "block_cache_size", config.block_cache.cache_size);
-    (*config.log)(LOG_DEBUG, "%24s: %u threads", "block_cache_threads", config.block_cache.num_threads);
-    (*config.log)(LOG_DEBUG, "%24s: %ums", "block_cache_timeout", config.block_cache.timeout);
-    (*config.log)(LOG_DEBUG, "%24s: %ums", "block_cache_write_delay", config.block_cache.write_delay);
-    (*config.log)(LOG_DEBUG, "%24s: %u blocks", "read_ahead", config.block_cache.read_ahead);
-    (*config.log)(LOG_DEBUG, "%24s: %u blocks", "read_ahead_trigger", config.block_cache.read_ahead_trigger);
+    (*config.log)(LOG_DEBUG, "%16s: %jd", "num_blocks", (intmax_t)config.num_blocks);
+    (*config.log)(LOG_DEBUG, "%16s: 0%o", "file_mode", config.fuse_ops.file_mode);
+    (*config.log)(LOG_DEBUG, "%16s: %s", "read_only", config.fuse_ops.read_only ? "true" : "false");
+    (*config.log)(LOG_DEBUG, "%16s: %us", "timeout", config.http_io.timeout);
+    (*config.log)(LOG_DEBUG, "%16s: %ums", "initial_retry_pause", config.http_io.initial_retry_pause);
+    (*config.log)(LOG_DEBUG, "%16s: %ums", "max_retry_pause", config.http_io.max_retry_pause);
+    (*config.log)(LOG_DEBUG, "%16s: %ums", "min_write_delay", config.ec_protect.min_write_delay);
+    (*config.log)(LOG_DEBUG, "%16s: %ums", "md5_cache_time", config.ec_protect.cache_time);
+    (*config.log)(LOG_DEBUG, "%16s: %u entries", "md5_cache_size", config.ec_protect.cache_size);
+    (*config.log)(LOG_DEBUG, "%16s: %u entries", "block_cache_size", config.block_cache.cache_size);
+    (*config.log)(LOG_DEBUG, "%16s: %u threads", "block_cache_threads", config.block_cache.num_threads);
+    (*config.log)(LOG_DEBUG, "%16s: %ums", "block_cache_write_delay", config.block_cache.write_delay);
     (*config.log)(LOG_DEBUG, "fuse_main arguments:");
     for (i = 0; i < config.fuse_args.argc; i++)
         (*config.log)(LOG_DEBUG, "  [%d] = \"%s\"", i, config.fuse_args.argv[i]);
@@ -1146,76 +1046,65 @@ usage(void)
 
     fprintf(stderr, "Usage: s3backer [options] bucket /mount/point\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "\t--%-27s %s\n", "accessFile=FILE", "File containing `accessID:accessKey' pairs");
-    fprintf(stderr, "\t--%-27s %s\n", "accessId=ID", "S3 access key ID");
-    fprintf(stderr, "\t--%-27s %s\n", "accessKey=KEY", "S3 secret access key");
-    fprintf(stderr, "\t--%-27s %s\n", "accessType=TYPE", "S3 ACL used when creating new items; one of:");
-    fprintf(stderr, "\t  %-27s ", "");
+    fprintf(stderr, "\t--%-24s %s\n", "accessFile=FILE", "File containing `accessID:accessKey' pairs");
+    fprintf(stderr, "\t--%-24s %s\n", "accessId=ID", "S3 access key ID");
+    fprintf(stderr, "\t--%-24s %s\n", "accessKey=KEY", "S3 secret access key");
+    fprintf(stderr, "\t--%-24s %s\n", "accessType=TYPE", "S3 ACL used when creating new items; one of:");
+    fprintf(stderr, "\t  %-24s ", "");
     for (i = 0; i < sizeof(s3_acls) / sizeof(*s3_acls); i++)
-        fprintf(stderr, "%s%s", i > 0 ? ", " : "  ", s3_acls[i]);
+        fprintf(stderr, "%s%s", i > 0 ? ", " : "", s3_acls[i]);
     fprintf(stderr, "\n");
-    fprintf(stderr, "\t--%-27s %s\n", "assumeEmpty", "Assume no blocks exist yet (no I/O for zero blocks)");
-    fprintf(stderr, "\t--%-27s %s\n", "baseURL=URL", "Base URL for all requests");
-    fprintf(stderr, "\t--%-27s %s\n", "blockCacheSize=NUM", "Block cache size");
-    fprintf(stderr, "\t--%-27s %s\n", "blockCacheThreads=NUM", "Block cache write-back thread pool size");
-    fprintf(stderr, "\t--%-27s %s\n", "blockCacheTimeout=MILLIS", "Block cache entry timeout (zero = infinite)");
-    fprintf(stderr, "\t--%-27s %s\n", "blockCacheWriteDelay=MILLIS", "Block cache maximum write-back delay");
-    fprintf(stderr, "\t--%-27s %s\n", "blockSize=SIZE", "Block size (with optional suffix 'K', 'M', 'G', etc.)");
-    fprintf(stderr, "\t--%-27s %s\n", "cacert=FILE", "Specify SSL certificate authority file");
-    fprintf(stderr, "\t--%-27s %s\n", "md5CacheSize=NUM", "Max size of MD5 cache (zero = disabled)");
-    fprintf(stderr, "\t--%-27s %s\n", "md5CacheTime=MILLIS", "Expire time for MD5 cache (zero = infinite)");
-    fprintf(stderr, "\t--%-27s %s\n", "timeout=SECONDS", "Max time allowed for one HTTP operation");
-    fprintf(stderr, "\t--%-27s %s\n", "debug", "Enable logging of debug messages");
-    fprintf(stderr, "\t--%-27s %s\n", "filename=NAME", "Name of backed file in filesystem");
-    fprintf(stderr, "\t--%-27s %s\n", "fileMode=MODE", "Permissions of backed file in filesystem");
-    fprintf(stderr, "\t--%-27s %s\n", "force", "Ignore different auto-detected block and file sizes");
-    fprintf(stderr, "\t--%-27s %s\n", "initialRetryPause=MILLIS", "Inital retry pause after stale data or server error");
-    fprintf(stderr, "\t--%-27s %s\n", "insecure", "Don't verify SSL server identity");
-    fprintf(stderr, "\t--%-27s %s\n", "maxRetryPause=MILLIS", "Max total pause after stale data or server error");
-    fprintf(stderr, "\t--%-27s %s\n", "minWriteDelay=MILLIS", "Minimum time between same block writes");
-    fprintf(stderr, "\t--%-27s %s\n", "prefix=STRING", "Prefix for resource names within bucket");
-    fprintf(stderr, "\t--%-27s %s\n", "readAhead=NUM", "Number of blocks to read-ahead");
-    fprintf(stderr, "\t--%-27s %s\n", "readAheadTrigger=NUM", "# of sequentially read blocks to trigger read-ahead");
-    fprintf(stderr, "\t--%-27s %s\n", "readOnly", "Return `Read-only file system' error for write attempts");
-    fprintf(stderr, "\t--%-27s %s\n", "size=SIZE", "File size (with optional suffix 'K', 'M', 'G', etc.)");
-    fprintf(stderr, "\t--%-27s %s\n", "ssl", "Same as --baseURL " S3_BASE_URL_HTTPS);
-    fprintf(stderr, "\t--%-27s %s\n", "statsFilename=NAME", "Name of statistics file in filesystem");
-    fprintf(stderr, "\t--%-27s %s\n", "test", "Run in local test mode (bucket is a directory)");
-    fprintf(stderr, "\t--%-27s %s\n", "timeout=SECONDS", "Specify HTTP operation timeout");
-    fprintf(stderr, "\t--%-27s %s\n", "version", "Show version information and exit");
-    fprintf(stderr, "\t--%-27s %s\n", "help", "Show this information and exit");
+    fprintf(stderr, "\t--%-24s %s\n", "assumeEmpty", "Assume no blocks exist yet (skip DELETE until PUT)");
+    fprintf(stderr, "\t--%-24s %s\n", "baseURL=URL", "Base URL for all requests");
+    fprintf(stderr, "\t--%-24s %s\n", "blockCacheSize=NUM", "Block cache size");
+    fprintf(stderr, "\t--%-24s %s\n", "blockCacheThreads=NUM", "Block cache write-back thread pool size");
+    fprintf(stderr, "\t--%-24s %s\n", "blockCacheWriteDelay=MILLIS", "Block cache maximum write-back delay");
+    fprintf(stderr, "\t--%-24s %s\n", "blockSize=SIZE", "Block size (with optional suffix 'K', 'M', 'G', etc.)");
+    fprintf(stderr, "\t--%-24s %s\n", "md5CacheSize=NUM", "Max size of MD5 cache (zero = disabled)");
+    fprintf(stderr, "\t--%-24s %s\n", "md5CacheTime=MILLIS", "Expire time for MD5 cache (zero = infinite)");
+    fprintf(stderr, "\t--%-24s %s\n", "timeout=SECONDS", "Max time allowed for one HTTP operation");
+    fprintf(stderr, "\t--%-24s %s\n", "debug", "Enable logging of debug messages");
+    fprintf(stderr, "\t--%-24s %s\n", "filename=NAME", "Name of backed file in filesystem");
+    fprintf(stderr, "\t--%-24s %s\n", "fileMode=MODE", "Permissions of backed file in filesystem");
+    fprintf(stderr, "\t--%-24s %s\n", "force", "Ignore different auto-detected block and file sizes");
+    fprintf(stderr, "\t--%-24s %s\n", "initialRetryPause=MILLIS", "Inital retry pause after stale data or server error");
+    fprintf(stderr, "\t--%-24s %s\n", "maxRetryPause=MILLIS", "Max total pause after stale data or server error");
+    fprintf(stderr, "\t--%-24s %s\n", "minWriteDelay=MILLIS", "Minimum time between same block writes");
+    fprintf(stderr, "\t--%-24s %s\n", "prefix=STRING", "Prefix for resource names within bucket");
+    fprintf(stderr, "\t--%-24s %s\n", "readOnly", "Return `Read-only file system' error for write attempts");
+    fprintf(stderr, "\t--%-24s %s\n", "size=SIZE", "File size (with optional suffix 'K', 'M', 'G', etc.)");
+    fprintf(stderr, "\t--%-24s %s\n", "statsFilename=NAME", "Name of statistics file in filesystem");
+    fprintf(stderr, "\t--%-24s %s\n", "version", "Show version information and exit");
+    fprintf(stderr, "\t--%-24s %s\n", "help", "Show this information and exit");
     fprintf(stderr, "Default values:\n");
-    fprintf(stderr, "\t--%-27s \"%s\"\n", "accessFile", "$HOME/" S3BACKER_DEFAULT_PWD_FILE);
-    fprintf(stderr, "\t--%-27s %s\n", "accessId", "The first one listed in `accessFile'");
-    fprintf(stderr, "\t--%-27s \"%s\"\n", "accessType", S3BACKER_DEFAULT_ACCESS_TYPE);
-    fprintf(stderr, "\t--%-27s \"%s\"\n", "baseURL", S3BACKER_DEFAULT_BASE_URL);
-    fprintf(stderr, "\t--%-27s %u\n", "blockCacheSize", S3BACKER_DEFAULT_BLOCK_CACHE_SIZE);
-    fprintf(stderr, "\t--%-27s %u\n", "blockCacheThreads", S3BACKER_DEFAULT_BLOCK_CACHE_NUM_THREADS);
-    fprintf(stderr, "\t--%-27s %u\n", "blockCacheTimeout", S3BACKER_DEFAULT_BLOCK_CACHE_TIMEOUT);
-    fprintf(stderr, "\t--%-27s %u\n", "blockCacheWriteDelay", S3BACKER_DEFAULT_BLOCK_CACHE_WRITE_DELAY);
-    fprintf(stderr, "\t--%-27s %d\n", "blockSize", S3BACKER_DEFAULT_BLOCKSIZE);
-    fprintf(stderr, "\t--%-27s %u\n", "md5CacheSize", S3BACKER_DEFAULT_MD5_CACHE_SIZE);
-    fprintf(stderr, "\t--%-27s %u\n", "md5CacheTime", S3BACKER_DEFAULT_MD5_CACHE_TIME);
-    fprintf(stderr, "\t--%-27s %u\n", "timeout", S3BACKER_DEFAULT_TIMEOUT);
-    fprintf(stderr, "\t--%-27s 0%03o (0%03o if `--readOnly')\n", "fileMode", S3BACKER_DEFAULT_FILE_MODE, S3BACKER_DEFAULT_FILE_MODE_READ_ONLY);
-    fprintf(stderr, "\t--%-27s \"%s\"\n", "filename", S3BACKER_DEFAULT_FILENAME);
-    fprintf(stderr, "\t--%-27s \"%s\"\n", "statsFilename", S3BACKER_DEFAULT_STATS_FILENAME);
-    fprintf(stderr, "\t--%-27s %u\n", "initialRetryPause", S3BACKER_DEFAULT_INITIAL_RETRY_PAUSE);
-    fprintf(stderr, "\t--%-27s %u\n", "maxRetryPause", S3BACKER_DEFAULT_MAX_RETRY_PAUSE);
-    fprintf(stderr, "\t--%-27s %u\n", "minWriteDelay", S3BACKER_DEFAULT_MIN_WRITE_DELAY);
-    fprintf(stderr, "\t--%-27s \"%s\"\n", "prefix", S3BACKER_DEFAULT_PREFIX);
-    fprintf(stderr, "\t--%-27s %u\n", "readAhead", S3BACKER_DEFAULT_READ_AHEAD);
-    fprintf(stderr, "\t--%-27s %u\n", "readAheadTrigger", S3BACKER_DEFAULT_READ_AHEAD_TRIGGER);
+    fprintf(stderr, "\t--%-24s \"%s\"\n", "accessFile", "$HOME/" S3BACKER_DEFAULT_PWD_FILE);
+    fprintf(stderr, "\t--%-24s %s\n", "accessId", "The first one listed in `accessFile'");
+    fprintf(stderr, "\t--%-24s \"%s\"\n", "accessType", S3BACKER_DEFAULT_ACCESS_TYPE);
+    fprintf(stderr, "\t--%-24s \"%s\"\n", "baseURL", S3BACKER_DEFAULT_BASE_URL);
+    fprintf(stderr, "\t--%-24s %u\n", "blockCacheSize", S3BACKER_DEFAULT_BLOCK_CACHE_SIZE);
+    fprintf(stderr, "\t--%-24s %u\n", "blockCacheThreads", S3BACKER_DEFAULT_BLOCK_CACHE_NUM_THREADS);
+    fprintf(stderr, "\t--%-24s %u\n", "blockCacheWriteDelay", S3BACKER_DEFAULT_BLOCK_CACHE_WRITE_DELAY);
+    fprintf(stderr, "\t--%-24s %d\n", "blockSize", S3BACKER_DEFAULT_BLOCKSIZE);
+    fprintf(stderr, "\t--%-24s %u\n", "md5CacheSize", S3BACKER_DEFAULT_MD5_CACHE_SIZE);
+    fprintf(stderr, "\t--%-24s %u\n", "md5CacheTime", S3BACKER_DEFAULT_MD5_CACHE_TIME);
+    fprintf(stderr, "\t--%-24s %u\n", "timeout", S3BACKER_DEFAULT_TIMEOUT);
+    fprintf(stderr, "\t--%-24s 0%03o (0%03o if `--readOnly')\n", "fileMode", S3BACKER_DEFAULT_FILE_MODE, S3BACKER_DEFAULT_FILE_MODE_READ_ONLY);
+    fprintf(stderr, "\t--%-24s \"%s\"\n", "filename", S3BACKER_DEFAULT_FILENAME);
+    fprintf(stderr, "\t--%-24s \"%s\"\n", "statsFilename", S3BACKER_DEFAULT_STATS_FILENAME);
+    fprintf(stderr, "\t--%-24s %u\n", "initialRetryPause", S3BACKER_DEFAULT_INITIAL_RETRY_PAUSE);
+    fprintf(stderr, "\t--%-24s %u\n", "maxRetryPause", S3BACKER_DEFAULT_MAX_RETRY_PAUSE);
+    fprintf(stderr, "\t--%-24s %u\n", "minWriteDelay", S3BACKER_DEFAULT_MIN_WRITE_DELAY);
+    fprintf(stderr, "\t--%-24s \"%s\"\n", "prefix", S3BACKER_DEFAULT_PREFIX);
     fprintf(stderr, "FUSE options (partial list):\n");
-    fprintf(stderr, "\t%-29s %s\n", "-o allow_root", "Allow root (only) to view backed file");
-    fprintf(stderr, "\t%-29s %s\n", "-o allow_other", "Allow all users to view backed file");
-    fprintf(stderr, "\t%-29s %s\n", "-o nonempty", "Allow all users to view backed file");
-    fprintf(stderr, "\t%-29s %s\n", "-o uid=UID", "Set user ID");
-    fprintf(stderr, "\t%-29s %s\n", "-o gid=GID", "Set group ID");
-    fprintf(stderr, "\t%-29s %s\n", "-o sync_read", "Do synchronous reads");
-    fprintf(stderr, "\t%-29s %s\n", "-o max_readahead=NUM", "Set maximum read-ahead (bytes)");
-    fprintf(stderr, "\t%-29s %s\n", "-f", "Run in the foreground (do not fork)");
-    fprintf(stderr, "\t%-29s %s\n", "-d", "Debug mode (implies -f)");
-    fprintf(stderr, "\t%-29s %s\n", "-s", "Run in single-threaded mode");
+    fprintf(stderr, "\t%-24s %s\n", "-o allow_root", "Allow root (only) to view backed file");
+    fprintf(stderr, "\t%-24s %s\n", "-o allow_other", "Allow all users to view backed file");
+    fprintf(stderr, "\t%-24s %s\n", "-o nonempty", "Allow all users to view backed file");
+    fprintf(stderr, "\t%-24s %s\n", "-o uid=UID", "Set user ID");
+    fprintf(stderr, "\t%-24s %s\n", "-o gid=GID", "Set group ID");
+    fprintf(stderr, "\t%-24s %s\n", "-o sync_read", "Do synchronous reads");
+    fprintf(stderr, "\t%-24s %s\n", "-o max_readahead=NUM", "Set maximum read-ahead (bytes)");
+    fprintf(stderr, "\t%-24s %s\n", "-f", "Run in the foreground (do not fork)");
+    fprintf(stderr, "\t%-24s %s\n", "-d", "Debug mode (implies -f)");
+    fprintf(stderr, "\t%-24s %s\n", "-s", "Run in single-threaded mode");
 }
 
